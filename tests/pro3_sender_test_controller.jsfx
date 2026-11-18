@@ -1,0 +1,40 @@
+desc:Pro 3 sender test controller
+options:gmem=Pro3PatchSender
+in_pin:none
+out_pin:none
+
+// Copyright 2026 Roman Altenburg (Digby)
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE for the license text.
+
+@init
+ext_noinit = 1;
+
+@block
+publish_heartbeat ? gmem[3] = time_precise();
+write_state ? (
+    gmem[0] = desired_state;
+    write_state = 0;
+);
+publish_load ? (
+    load_index = 0;
+    loop(4693,
+        load_index == 0 ? gmem[16 + load_index] = $xF0
+            : load_index == 1 ? gmem[16 + load_index] = $x01
+            : load_index == 2 ? gmem[16 + load_index] = $x31
+            : load_index == 3 ? gmem[16 + load_index] = $x03
+            : load_index == 4692 ? gmem[16 + load_index] = $xF7
+            : gmem[16 + load_index] = (load_index * 17) & 127;
+        load_index += 1;
+    );
+    gmem[0] = desired_state;
+    publish_load = 0;
+);
+observed_state = gmem[0];
+observed_owner = gmem[2];
+observed_operation = gmem[6];
+copy_index = 0;
+loop(4693,
+    copy_index[0] = gmem[16 + copy_index];
+    copy_index += 1;
+);

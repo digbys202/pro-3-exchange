@@ -1,0 +1,495 @@
+desc:Pro 3 Exchange
+options:gmem=Pro3PatchSender
+filename:0,pro3_exchange_header.png
+in_pin:none
+out_pin:none
+
+// Copyright 2026 Roman Altenburg (Digby)
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE for the license text.
+
+@init
+ext_noinit = 1;
+ext_nodenorm = 1;
+
+function decode_patch_name() (
+    patch_name_length = 20;
+    name_index = 0;
+    loop(20,
+        raw_name_index = 321 + name_index;
+        packed_group = floor(raw_name_index / 7);
+        packed_bit = raw_name_index - packed_group * 7;
+        packed_index = 4 + packed_group * 8;
+        name_byte = snapshot_buffer[packed_index + 1 + packed_bit]
+            + ((snapshot_buffer[packed_index] >> packed_bit) & 1) * 128;
+        patch_name_buffer[name_index] = name_byte >= 32 && name_byte <= 126 ? name_byte : 32;
+        name_index += 1;
+    );
+    while (patch_name_length > 0
+        && (patch_name_buffer[patch_name_length - 1] == 32 || patch_name_buffer[patch_name_length - 1] == 0)) (
+        patch_name_length -= 1;
+    );
+);
+
+function receive_loaded_snapshot() (
+    load_valid = gmem[16] == $xF0 && gmem[17] == $x01
+        && gmem[18] == $x31 && gmem[19] == $x03
+        && gmem[4708] == $xF7;
+    load_index = 4;
+    while (load_valid && load_index < 4692) (
+        load_byte = gmem[16 + load_index];
+        load_valid = load_byte >= 0 && load_byte < 128
+            && load_byte == floor(load_byte);
+        load_index += 1;
+    );
+    load_valid ? (
+        load_index = 0;
+        loop(4693,
+            snapshot_buffer[load_index] = gmem[16 + load_index];
+            load_index += 1;
+        );
+        snapshot_length = 4693;
+        decode_patch_name();
+        grab_state = 6;
+    );
+    load_valid;
+);
+
+receive_buffer = 0;
+receive_capacity = 65536;
+connection_state = 0;
+startup_samples = 0;
+reply_deadline = 0;
+last_header_length = 0;
+header_buffer = 65536;
+event_count = 0;
+total_received_bytes = 0;
+end_marker_count = 0;
+continuation_count = 0;
+last_event_length = 0;
+last_event_first = 0;
+last_event_last = 0;
+assembly_buffer = 65552;
+assembly_capacity = 4695;
+assembly_active = 0;
+assembly_length = 0;
+completed_count = 0;
+last_complete_length = 0;
+valid_pro3_dump = 0;
+valid_edit_dump_count = 0;
+valid_edit_dump_count_at_request = 0;
+snapshot_buffer = 71000;
+patch_name_buffer = 78000;
+snapshot_length != 4693 ? (
+    snapshot_length = 0;
+    patch_name_length = 0;
+) : decode_patch_name();
+grab_requested = 0;
+grab_state = snapshot_length == 4693 ? 5 : 0;
+send_requested = 0;
+send_state = 0;
+load_requested = 0;
+load_state = 0;
+save_requested = 0;
+save_state = 0;
+sender_id = atomic_add(gmem[1], 1);
+send_deadline = 0;
+mouse_was_down = 0;
+show_debug_diagnostics = 0;
+
+function request_edit_buffer(for_grab) (
+    assembly_active = 0;
+    assembly_length = 0;
+    valid_pro3_dump = 0;
+    valid_edit_dump_count_at_request = valid_edit_dump_count;
+    for_grab ? send_state = 0;
+    sent_length = midisend_str(0, "\xF0\x01\x31\x06\xF7");
+    sent_length == 5 ? (
+        connection_state = 1;
+        reply_deadline = time_precise() + 5;
+        for_grab ? grab_state = 1;
+    ) : (
+        connection_state = 4;
+        for_grab ? grab_state = 4;
+    );
+);
+
+function receive_sysex_byte(byte_value) (
+    byte_value == $xF0 ? (
+        assembly_active = 1;
+        assembly_length = 1;
+        assembly_buffer[0] = byte_value;
+    ) : byte_value < $xF8 && assembly_active ? (
+        byte_value < $x80 || byte_value == $xF7 ? (
+            assembly_length < assembly_capacity ? (
+                assembly_buffer[assembly_length] = byte_value;
+                assembly_length += 1;
+                byte_value == $xF7 ? (
+                    assembly_active = 0;
+                    completed_count += 1;
+                    last_complete_length = assembly_length;
+                    last_header_length = min(assembly_length, 8);
+                    memcpy(header_buffer, assembly_buffer, last_header_length);
+                    valid_pro3_dump = assembly_length >= 5
+                        && assembly_buffer[1] == $x01
+                        && assembly_buffer[2] == $x31
+                        && ((assembly_buffer[3] == $x03 && assembly_length == 4693)
+                            || (assembly_buffer[3] == $x02 && assembly_length == 4695));
+                    valid_pro3_dump && assembly_buffer[3] == $x03 ? (
+                            valid_edit_dump_count += 1;
+                            connection_state = 2;
+                            grab_state == 1 ? (
+                                memcpy(snapshot_buffer, assembly_buffer, assembly_length);
+                                snapshot_length = assembly_length;
+                                decode_patch_name();
+                                grab_state = 2;
+                            );
+                        );
+                );
+            ) : (
+                assembly_active = 0;
+                assembly_length = 0;
+            );
+        ) : (
+            assembly_active = 0;
+            assembly_length = 0;
+        );
+    );
+);
+
+@block
+while ((received_length = midirecv_buf(event_offset, receive_buffer, receive_capacity)) > 0) (
+    event_count += 1;
+    total_received_bytes += received_length;
+    last_event_length = received_length;
+    last_event_first = receive_buffer[0];
+    last_event_last = receive_buffer[received_length - 1];
+    is_continuation = last_event_first < $x80 || last_event_first == $xF7;
+    is_continuation ? continuation_count += 1;
+    scan_index = 0;
+    loop(received_length,
+        receive_buffer[scan_index] == $xF7 ? end_marker_count += 1;
+        receive_sysex_byte(receive_buffer[scan_index]);
+        scan_index += 1;
+    );
+    is_sysex = receive_buffer[0] == $xF0;
+    is_sysex ? (
+        last_header_length = min(received_length, 8);
+        memcpy(header_buffer, receive_buffer, last_header_length);
+    );
+    !is_sysex && !is_continuation ? midisend_buf(event_offset, receive_buffer, received_length);
+);
+
+connection_state == 0 ? (
+    startup_samples += samplesblock;
+    startup_samples >= srate * 0.5 ? (
+        request_edit_buffer(0);
+    );
+);
+
+grab_requested ? (
+    grab_requested = 0;
+    connection_state != 0 && connection_state != 1 && send_state != 3
+        && load_state != 3 && save_state != 3 ? request_edit_buffer(1);
+);
+
+send_requested ? (
+    send_requested = 0;
+    snapshot_length == 4693 && grab_state != 1 && send_state != 3
+        && load_state != 3 && save_state != 3 ? (
+        gmem[3] > 0 && abs(time_precise() - gmem[3]) < 2 ? (
+            atomic_setifequal(gmem[0], 0, 1) == 0 ? (
+                gmem[2] = sender_id;
+                copy_index = 0;
+                loop(snapshot_length,
+                    gmem[16 + copy_index] = snapshot_buffer[copy_index];
+                    copy_index += 1;
+                );
+                gmem[5] = time_precise();
+                gmem[6] = 1;
+                send_deadline = gmem[5] + 30;
+                send_state = 3;
+                atomic_set(gmem[0], 2);
+            ) : send_state = 4;
+        ) : send_state = 5;
+    );
+);
+
+load_requested ? (
+    load_requested = 0;
+    send_state != 3 && load_state != 3 && save_state != 3 ? (
+        gmem[3] > 0 && abs(time_precise() - gmem[3]) < 2 ? (
+            atomic_setifequal(gmem[0], 0, 1) == 0 ? (
+                gmem[2] = sender_id;
+                gmem[5] = time_precise();
+                gmem[6] = 3;
+                load_state = 3;
+                atomic_set(gmem[0], 2);
+            ) : load_state = 5;
+        ) : load_state = 5;
+    );
+);
+
+save_requested ? (
+    save_requested = 0;
+    snapshot_length == 4693 && grab_state != 1 && send_state != 3
+        && load_state != 3 && save_state != 3 ? (
+        gmem[3] > 0 && abs(time_precise() - gmem[3]) < 2 ? (
+            atomic_setifequal(gmem[0], 0, 1) == 0 ? (
+                gmem[2] = sender_id;
+                copy_index = 0;
+                loop(snapshot_length,
+                    gmem[16 + copy_index] = snapshot_buffer[copy_index];
+                    copy_index += 1;
+                );
+                gmem[5] = time_precise();
+                gmem[6] = 2;
+                save_state = 3;
+                atomic_set(gmem[0], 2);
+            ) : save_state = 4;
+        ) : save_state = 5;
+    );
+);
+
+load_state == 3 && gmem[2] == sender_id ? (
+    bridge_state = atomic_get(gmem[0]);
+    bridge_state == 4 ? (
+        load_state = receive_loaded_snapshot() ? 1 : 2;
+        atomic_setifequal(gmem[0], bridge_state, 0);
+    ) : bridge_state == 5 || bridge_state == 6 ? (
+        load_state = bridge_state == 6 ? 4 : 2;
+        atomic_setifequal(gmem[0], bridge_state, 0);
+    );
+);
+
+send_state == 3 && gmem[2] == sender_id ? (
+    bridge_state = atomic_get(gmem[0]);
+    bridge_state == 4 || bridge_state == 5 ? (
+        send_state = bridge_state == 4 ? 1 : 2;
+        atomic_setifequal(gmem[0], bridge_state, 0);
+    ) : time_precise() >= send_deadline ? (
+        send_state = 6;
+    );
+);
+
+save_state == 3 && gmem[2] == sender_id ? (
+    bridge_state = atomic_get(gmem[0]);
+    bridge_state == 4 || bridge_state == 5 || bridge_state == 6 ? (
+        save_state = bridge_state == 4 ? 1 : bridge_state == 6 ? 6 : 2;
+        atomic_setifequal(gmem[0], bridge_state, 0);
+    );
+);
+
+connection_state == 1 && time_precise() >= reply_deadline ? (
+    connection_state = 3;
+    grab_state == 1 ? grab_state = 3;
+);
+
+@serialize
+file_avail(0) >= 0 ? (
+    stored_version = 0;
+    stored_length = 0;
+    snapshot_length = 0;
+    patch_name_length = 0;
+    grab_state = 0;
+    grab_requested = 0;
+    send_requested = 0;
+    send_state = 0;
+    load_requested = 0;
+    load_state = 0;
+    save_requested = 0;
+    save_state = 0;
+    file_var(0, stored_version);
+    file_var(0, stored_length);
+    stored_version == 1 && stored_length == 4693 ? (
+        restored_length = file_mem(0, 76000, stored_length);
+        stored_valid = restored_length == 4693
+            && 76000[0] == $xF0 && 76000[1] == $x01
+            && 76000[2] == $x31 && 76000[3] == $x03
+            && 76000[4692] == $xF7;
+        stored_index = 4;
+        while (stored_valid && stored_index < 4692) (
+            stored_byte = 76000[stored_index];
+            stored_valid = stored_byte >= 0 && stored_byte < 128
+                && stored_byte == floor(stored_byte);
+            stored_index += 1;
+        );
+        stored_valid ? (
+            memcpy(71000, 76000, stored_length);
+            snapshot_length = stored_length;
+            decode_patch_name();
+            grab_state = 5;
+        );
+    );
+) : (
+    stored_version = 1;
+    file_var(0, stored_version);
+    file_var(0, snapshot_length);
+    snapshot_length == 4693 ? file_mem(0, 71000, snapshot_length);
+);
+
+@gfx 619 396
+gfx_clear = $x202020;
+gfx_x = 0;
+gfx_y = 0;
+gfx_blit(0, 1, 0);
+gfx_x = 16;
+gfx_y = 110;
+connection_state == 2 ? (
+    gfx_set(0.4, 0.85, 0.5, 1);
+    gfx_drawstr("Online");
+) : connection_state == 3 ? (
+    gfx_set(0.95, 0.7, 0.35, 1);
+    gfx_drawstr("No reply");
+) : connection_state == 4 ? (
+    gfx_set(0.95, 0.45, 0.4, 1);
+    gfx_drawstr("Request could not be sent");
+) : (
+    gfx_drawstr("Checking...");
+);
+gfx_set(0.65, 0.65, 0.65, 1);
+gfx_measurestr("v1.0", version_width, version_height);
+gfx_x = 605 - version_width;
+gfx_y = 110;
+gfx_drawstr("v1.0");
+gfx_set(0.9, 0.9, 0.9, 1);
+gfx_setfont(1, "DejaVu Sans", 14);
+gfx_x = 16;
+gfx_y = 139;
+gfx_setfont(1, "DejaVu Sans", 20);
+gfx_drawstr("Patch name: ");
+patch_name_length > 0 ? (
+    name_index = 0;
+    loop(patch_name_length,
+        gfx_printf("%c", patch_name_buffer[name_index]);
+        name_index += 1;
+    );
+);
+gfx_setfont(1, "DejaVu Sans", 14);
+show_debug_diagnostics ? (
+    gfx_x = 320;
+    gfx_y = 110;
+    gfx_drawstr("Header:");
+    header_index = 0;
+    loop(last_header_length,
+        gfx_printf(" %02X", header_buffer[header_index]);
+        header_index += 1;
+    );
+    gfx_x = 320;
+    gfx_y = 134;
+    gfx_printf("All events: %d    Total bytes: %d", event_count, total_received_bytes);
+    gfx_x = 320;
+    gfx_y = 158;
+    gfx_printf("Continuation events: %d    F7 markers: %d", continuation_count, end_marker_count);
+    gfx_x = 320;
+    gfx_y = 182;
+    gfx_printf("Last event: %d bytes    First: %02X    Last: %02X", last_event_length, last_event_first, last_event_last);
+    gfx_x = 320;
+    gfx_y = 206;
+    gfx_printf("Complete dumps: %d    Last complete: %d", completed_count, last_complete_length);
+    gfx_x = 320;
+    gfx_y = 230;
+    gfx_printf("Edit-buffer replies since check: %d", valid_edit_dump_count - valid_edit_dump_count_at_request);
+);
+
+button_y = 172;
+grab_enabled = connection_state != 0 && connection_state != 1
+    && !grab_requested && !send_requested && !save_requested
+    && !load_requested && send_state != 3 && load_state != 3 && save_state != 3;
+sender_online = gmem[3] > 0 && abs(time_precise() - gmem[3]) < 2;
+send_enabled = snapshot_length == 4693 && sender_online
+    && !grab_requested && !send_requested && !load_requested && !save_requested
+    && grab_state != 1 && send_state != 3 && load_state != 3 && save_state != 3;
+load_enabled = sender_online && !grab_requested && !send_requested
+    && !load_requested && !save_requested && grab_state != 1
+    && send_state != 3 && load_state != 3 && save_state != 3;
+save_enabled = snapshot_length == 4693 && sender_online
+    && !grab_requested && !send_requested && !load_requested && !save_requested
+    && grab_state != 1 && send_state != 3 && load_state != 3 && save_state != 3;
+mouse_down = mouse_cap & 1;
+mouse_down && !mouse_was_down && grab_enabled
+    && mouse_x >= 165 && mouse_x < 305
+    && mouse_y >= button_y && mouse_y < button_y + 38 ? grab_requested = 1;
+mouse_down && !mouse_was_down && send_enabled
+    && mouse_x >= 15 && mouse_x < 155
+    && mouse_y >= button_y && mouse_y < button_y + 38 ? send_requested = 1;
+mouse_down && !mouse_was_down && load_enabled
+    && mouse_x >= 315 && mouse_x < 455
+    && mouse_y >= button_y && mouse_y < button_y + 38 ? load_requested = 1;
+mouse_down && !mouse_was_down && save_enabled
+    && mouse_x >= 465 && mouse_x < 605
+    && mouse_y >= button_y && mouse_y < button_y + 38 ? save_requested = 1;
+mouse_was_down = mouse_down;
+send_enabled ? gfx_set(0.48235, 0.13725, 0.42353, 1) : gfx_set(0.21961, 0.14510, 0.20784, 1);
+gfx_rect(15, button_y, 140, 38);
+send_enabled ? gfx_set(0.95, 0.95, 0.95, 1) : gfx_set(0.55, 0.55, 0.55, 1);
+gfx_setfont(1, "DejaVu Sans", 16);
+gfx_measurestr("Send Patch", label_width, label_height);
+gfx_x = 15 + (140 - label_width) / 2;
+gfx_y = button_y + (38 - label_height) / 2;
+gfx_drawstr("Send Patch");
+grab_enabled ? gfx_set(0.6, 0.23922, 0.34902, 1) : gfx_set(0.26667, 0.19216, 0.21569, 1);
+gfx_rect(165, button_y, 140, 38);
+grab_enabled ? gfx_set(0.95, 0.95, 0.95, 1) : gfx_set(0.55, 0.55, 0.55, 1);
+gfx_measurestr("Grab Patch", label_width, label_height);
+gfx_x = 165 + (140 - label_width) / 2;
+gfx_y = button_y + (38 - label_height) / 2;
+gfx_drawstr("Grab Patch");
+load_enabled ? gfx_set(0.77255, 0.38824, 0.24314, 1) : gfx_set(0.32157, 0.23922, 0.21176, 1);
+gfx_rect(315, button_y, 140, 38);
+load_enabled ? gfx_set(0.95, 0.95, 0.95, 1) : gfx_set(0.55, 0.55, 0.55, 1);
+gfx_measurestr("Load from Disk", label_width, label_height);
+gfx_x = 315 + (140 - label_width) / 2;
+gfx_y = button_y + (38 - label_height) / 2;
+gfx_drawstr("Load from Disk");
+save_enabled ? gfx_set(0.96471, 0.55686, 0.13725, 1) : gfx_set(0.37255, 0.28627, 0.19608, 1);
+gfx_rect(465, button_y, 140, 38);
+save_enabled ? gfx_set(0.95, 0.95, 0.95, 1) : gfx_set(0.55, 0.55, 0.55, 1);
+gfx_measurestr("Save to Disk", label_width, label_height);
+gfx_x = 465 + (140 - label_width) / 2;
+gfx_y = button_y + (38 - label_height) / 2;
+gfx_drawstr("Save to Disk");
+gfx_set(0.9, 0.9, 0.9, 1);
+gfx_setfont(1, "DejaVu Sans", 14);
+gfx_x = 16;
+gfx_y = 228;
+grab_state == 1 ? gfx_drawstr("Grabbing...")
+    : grab_state == 2 ? gfx_drawstr("Patch grabbed")
+    : grab_state == 3 ? gfx_drawstr("Grab failed: no reply")
+    : grab_state == 4 ? gfx_drawstr("Grab failed: request could not be sent")
+    : grab_state == 5 ? gfx_drawstr("Patch loaded from project")
+    : grab_state == 6 ? gfx_drawstr("Patch loaded from disk; not sent")
+    : gfx_drawstr("No patch grabbed");
+gfx_x = 16;
+gfx_y = 253;
+send_state == 1 ? gfx_drawstr("Patch sent to MIDI output")
+    : send_state == 2 ? gfx_drawstr("Send failed; check the sender console")
+    : send_state == 3 ? gfx_drawstr("Sending...")
+    : load_state == 3 ? gfx_drawstr("Send paused: Load is active")
+    : send_state == 4 ? gfx_drawstr("Send failed: sender busy")
+    : send_state == 5 ? gfx_drawstr("Send failed: sender not running")
+    : send_state == 6 ? gfx_drawstr("Send timed out; check the sender")
+    : snapshot_length != 4693 ? gfx_drawstr("Send disabled: grab a patch first")
+    : !sender_online ? gfx_drawstr("Send disabled: start Exchange Helper")
+    : grab_state == 1 ? gfx_drawstr("Send disabled: Grab Patch is active");
+gfx_x = 16;
+gfx_y = 332;
+gfx_printf("Snapshot: %d bytes", snapshot_length);
+gfx_x = 16;
+gfx_y = 356;
+save_state == 1 ? gfx_drawstr("Saved .syx to disk")
+    : save_state == 2 ? gfx_drawstr("Save failed; check the sender console")
+    : save_state == 3 ? gfx_drawstr("Saving...")
+    : load_state == 3 ? gfx_drawstr("Save paused: Load is active")
+    : save_state == 4 ? gfx_drawstr("Save disabled: sender busy")
+    : save_state == 5 ? gfx_drawstr("Save failed; check the sender console")
+    : save_state == 6 ? gfx_drawstr("Save cancelled")
+    : snapshot_length != 4693 ? gfx_drawstr("Save disabled: grab a patch first")
+    : !sender_online ? gfx_drawstr("Save disabled: start Exchange Helper");
+gfx_x = 16;
+gfx_y = 380;
+load_state == 2 ? gfx_drawstr("Load failed; check the sender console")
+    : load_state == 3 ? gfx_drawstr("Loading...")
+    : load_state == 4 ? gfx_drawstr("Load cancelled")
+    : load_state == 5 ? gfx_drawstr("Load unavailable: sender busy")
+    : !sender_online ? gfx_drawstr("Load disabled: start Exchange Helper");
